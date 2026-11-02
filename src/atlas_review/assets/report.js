@@ -18,7 +18,8 @@ try { local = JSON.parse(localStorage.getItem(LSKEY)) || local; } catch (e) {}
 
 var opts = Object.assign({
   tolerance: 32, block: 8, minBlockDensity: 0.06, minRegionPx: 220,
-  mergeRadius: 2, ignoreStatusBar: true, detectShift: true
+  mergeRadius: 2, ignoreStatusBar: true, detectShift: true,
+  statusBar: [0, 0, 1, 0.07], ignoreBoxes: []
 }, DATA.defaults || {});
 
 /* `before`/`after` are app-wide build ids, not per-screen. That is what makes
@@ -118,10 +119,30 @@ function dilate(mask, w, h, r) {
   return out;
 }
 
+/* r + g + b rather than their mean: integer sums keep the shift search exact,
+   so it reaches the same verdict as the Python detector bit for bit. */
 function grayscale(data, w, h) {
-  var g = new Float32Array(w * h), p = data.data;
-  for (var i = 0, j = 0; i < g.length; i++, j += 4) g[i] = (p[j] + p[j + 1] + p[j + 2]) / 3;
+  var g = new Int32Array(w * h), p = data.data;
+  for (var i = 0, j = 0; i < g.length; i++, j += 4) g[i] = p[j] + p[j + 1] + p[j + 2];
   return g;
+}
+
+/* Normalised [x, y, w, h] boxes -> pixel mask, with the same floor-and-clamp
+   arithmetic as diff.box_bounds(). The status bar is one of these boxes; the
+   policy's other presets and ignore_boxes arrive in o.ignoreBoxes. */
+function ignoreMask(W, H, o) {
+  var boxes = (o.ignoreBoxes || []).slice();
+  if (o.ignoreStatusBar && o.statusBar) boxes.push(o.statusBar);
+  if (!boxes.length) return null;
+  var m = new Uint8Array(W * H);
+  boxes.forEach(function (b) {
+    var x0 = Math.min(W, Math.max(0, Math.floor(b[0] * W)));
+    var y0 = Math.min(H, Math.max(0, Math.floor(b[1] * H)));
+    var x1 = Math.min(W, Math.max(0, Math.floor((b[0] + b[2]) * W)));
+    var y1 = Math.min(H, Math.max(0, Math.floor((b[1] + b[3]) * H)));
+    for (var y = y0; y < y1; y++) for (var x = x0; x < x1; x++) m[y * W + x] = 1;
+  });
+  return m;
 }
 
 /* Same shape as the Python detector: tolerance, then a block grid with a
@@ -129,13 +150,14 @@ function grayscale(data, w, h) {
 function computeDiff(A, B, W, H, o) {
   var a = A.data, b = B.data, n = W * H;
   var raw = new Uint8Array(n);
-  // floor, not round: the Python detector slices with int(), and the two must
+  // floor, not round: the Python detector slices with floor(), and the two must
   // agree to the digit or a CI gate and this page will contradict each other.
-  var ignoreRows = o.ignoreStatusBar ? Math.floor(H * 0.07) : 0;
-  var comparable = n - ignoreRows * W;
+  var ignore = ignoreMask(W, H, o);
+  var comparable = n;
+  if (ignore) for (var k = 0; k < n; k++) comparable -= ignore[k];
 
   for (var i = 0, j = 0; i < n; i++, j += 4) {
-    if (i < ignoreRows * W) continue;
+    if (ignore && ignore[i]) continue;
     var d = Math.abs(a[j] - b[j]);
     var d2 = Math.abs(a[j + 1] - b[j + 1]); if (d2 > d) d = d2;
     var d3 = Math.abs(a[j + 2] - b[j + 2]); if (d3 > d) d = d3;
@@ -214,7 +236,8 @@ function label(grid, cols, rows, bs, W, H, mask, o) {
 
 /* Inserting a row pushes everything below it down. Without recognising that
    translation the report says "the whole list changed", which is true and
-   useless. Subsampled by 2 in both axes to stay interactive. */
+   useless. Subsampled by 2 in both axes to stay interactive; diff._detect_shift
+   samples the same pixels. ga/gb hold r+g+b, hence the final / 3. */
 function annotateShift(region, ga, gb, W, H) {
   var y0 = region.y, y1 = Math.min(H, region.y + region.h);
   var x0 = region.x, x1 = Math.min(W, region.x + region.w);
@@ -229,7 +252,7 @@ function annotateShift(region, ga, gb, W, H) {
         total += Math.abs(gb[y * W + x] - ga[sy * W + x]); count++;
       }
     }
-    return count ? total / count : Infinity;
+    return count ? total / count / 3 : Infinity;
   }
 
   var base = err(0);

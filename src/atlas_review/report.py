@@ -24,6 +24,7 @@ import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
+from .diff import IGNORE_PRESETS, DiffOptions
 from .models import Screen
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -79,6 +80,29 @@ def _frame_payload(image_path: Path, target_width: int) -> Dict[str, Any]:
     return {"src": "data:image/png;base64," + encoded, "w": scaled.width, "h": scaled.height}
 
 
+def detector_defaults(options: DiffOptions) -> Dict[str, Any]:
+    """The detector settings report.js starts from, mirroring `options`.
+
+    Every ignore box the CLI applies is forwarded, not just the status bar:
+    a policy that also masks the home indicator or an ad banner must not read
+    as changed in the page while `check` calls it clean.
+    """
+    ignore = list(options.ignore)
+    extra = [IGNORE_PRESETS[name] for name in ignore if name in IGNORE_PRESETS and name != "status_bar"]
+    extra += [tuple(box) for box in options.ignore_boxes]
+    return {
+        "tolerance": options.tolerance,
+        "block": options.block,
+        "minBlockDensity": options.min_block_density,
+        "minRegionPx": options.min_region_px,
+        "mergeRadius": options.merge_radius,
+        "ignoreStatusBar": "status_bar" in ignore,
+        "statusBar": list(IGNORE_PRESETS["status_bar"]),
+        "ignoreBoxes": [[float(v) for v in box] for box in extra],
+        "detectShift": options.detect_shift,
+    }
+
+
 def build_report(
     review: "AtlasReview",
     out: Path,
@@ -127,26 +151,21 @@ def build_report(
         "screens": [],
         "images": images,
         "alerts": [a.to_dict() for a in alert_report.sorted()],
-        "defaults": {
-            "tolerance": review.options.tolerance,
-            "block": review.options.block,
-            "minBlockDensity": review.options.min_block_density,
-            "minRegionPx": review.options.min_region_px,
-            "mergeRadius": review.options.merge_radius,
-            "ignoreStatusBar": "status_bar" in list(review.options.ignore),
-            "detectShift": review.options.detect_shift,
-        },
+        "defaults": detector_defaults(review.options),
     }
 
     total_frames = 0
     for screen in targets:
-        versions = [v for v in review.history(screen).versions() if v.build.id in kept]
+        every_version = review.history(screen).versions()
+        versions = [v for v in every_version if v.build.id in kept]
         if not versions:
             continue
         baseline = review.baseline(screen)
         # One width for every frame of a screen, matching what the detector
         # normalizes to, so the browser and the CLI measure the same pixels.
-        target_width = min([_frame_width(Path(v.image_path)) for v in versions] + [max_width])
+        # Taken over the whole history, as ScreenHistory.target_width() is,
+        # so `--builds N` cannot quietly pick a different scale than the CLI.
+        target_width = min([_frame_width(Path(v.image_path)) for v in every_version] + [max_width])
         frames: List[Dict[str, Any]] = []
         for version in versions:
             frame = _frame_payload(Path(version.image_path), target_width)
