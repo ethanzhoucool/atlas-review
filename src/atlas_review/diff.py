@@ -582,9 +582,7 @@ def compare_images(
             rs, cs = np.nonzero(member)
             y0, y1 = int(rs.min() * block), int(min(h, (rs.max() + 1) * block))
             x0, x1 = int(cs.min() * block), int(min(w, (cs.max() + 1) * block))
-            region_mask = np.zeros((h, w), dtype=bool)
-            region_mask[y0:y1, x0:x1] = True
-            changed_here = int((mask & region_mask).sum())
+            changed_here = int(mask[y0:y1, x0:x1].sum())
             region = Region(
                 x=x0, y=y0, w=x1 - x0, h=y1 - y0,
                 changed_pixels=changed_here,
@@ -623,10 +621,11 @@ def diff_versions(
         raise ValueError("no cached screenshot for %s at build %s" % (after.screen.name, missing))
     before_img = imaging.load_rgb(Path(before.image_path))
     after_img = imaging.load_rgb(Path(after.image_path))
-    mask, regions, changed_px, comparable, resized = compare_images(
-        before_img, after_img, options, target_width)
-    # Renderers must draw the same normalized frames the detector measured.
-    before_img, after_img, _ = normalize_pair(before_img, after_img, target_width)
+    # Normalise once, up front: the renderers must draw the same frames the
+    # detector measured, and resampling is the most expensive step of a diff.
+    # compare_images() finds the pair already at one width and leaves it be.
+    before_img, after_img, resized = normalize_pair(before_img, after_img, target_width)
+    mask, regions, changed_px, comparable, _ = compare_images(before_img, after_img, options)
     size = (max(before_img.width, after_img.width), max(before_img.height, after_img.height))
     result = DiffResult(
         before=before,
