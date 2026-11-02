@@ -71,7 +71,23 @@ function commentsOf(sid, bid) {
 
 /* --------------------------------------------------------- image access */
 
-var pixelCache = new Map();
+/* Decoded frames are ~4 bytes per pixel (1.7 MB for a 440x956 frame), and every
+   pair the overview measures adds two. Unbounded, a 30-screen report grew past
+   a gigabyte of renderer memory after a few build switches, so keep a
+   least-recently-used window large enough for the overview of one pair plus a
+   screen's filmstrip, and decode again past that. */
+var PIXEL_CACHE_BYTES = 192 * 1024 * 1024;
+var pixelCache = new Map(), pixelCacheBytes = 0;
+
+function cachePixels(key, data) {
+  pixelCache.set(key, data);
+  pixelCacheBytes += data.data.length;
+  while (pixelCacheBytes > PIXEL_CACHE_BYTES && pixelCache.size > 2) {
+    var oldest = pixelCache.keys().next().value;
+    pixelCacheBytes -= pixelCache.get(oldest).data.length;
+    pixelCache.delete(oldest);
+  }
+}
 
 function loadImage(src) {
   return new Promise(function (resolve, reject) {
@@ -87,7 +103,11 @@ function loadImage(src) {
    header and chrome stay aligned and the diff stays meaningful. */
 function pixels(frame, W, H) {
   var key = frame.build_id + "|" + frame.screen_id + "|" + W + "x" + H;
-  if (pixelCache.has(key)) return Promise.resolve(pixelCache.get(key));
+  if (pixelCache.has(key)) {
+    var hit = pixelCache.get(key);
+    pixelCache.delete(key); pixelCache.set(key, hit);   // most recently used
+    return Promise.resolve(hit);
+  }
   return loadImage(srcOf(frame)).then(function (img) {
     var c = document.createElement("canvas");
     c.width = W; c.height = H;
@@ -95,7 +115,8 @@ function pixels(frame, W, H) {
     ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, W, H);
     ctx.drawImage(img, 0, 0);
     var data = ctx.getImageData(0, 0, W, H);
-    pixelCache.set(key, data);
+    c.width = c.height = 0;   // free the scratch backing store now, not at the next GC
+    cachePixels(key, data);
     return data;
   });
 }
@@ -462,13 +483,32 @@ function paintCard(s, res) {
     return;
   }
   card.dataset.state = res.percent > 0 ? "changed" : "same";
-  var canvas = document.createElement("canvas");
-  renderHighlight(canvas, null, res.afterData, res.diff);
+  if (!res.thumb) res.thumb = thumbnail(res);
   thumb.innerHTML = "";
-  thumb.appendChild(canvas);
+  thumb.appendChild(res.thumb);
   meta.innerHTML = '<b class="' + (res.percent ? "chg" : "same") + '">' + res.percent.toFixed(2) + "%</b>" +
     '<span class="mut">' + (res.regions ? (res.regions + " region" + (res.regions === 1 ? "" : "s") +
       (res.moved ? ", " + res.moved + " moved" : "")) : "identical") + "</span>" + pill;
+}
+
+/* A card only needs a small picture. Render the highlight at full size once,
+   keep a downscaled copy, and drop the full-size frame and change mask the
+   measurement carried: holding them for every screen is what made the
+   overview's memory grow with the app instead of with the window. */
+var THUMB_WIDTH = 320;   // ~2x the narrowest card, so it stays sharp on HiDPI screens
+function thumbnail(res) {
+  var full = document.createElement("canvas");
+  renderHighlight(full, null, res.afterData, res.diff);
+  var scale = Math.min(1, THUMB_WIDTH / full.width);
+  var small = document.createElement("canvas");
+  small.width = Math.max(1, Math.round(full.width * scale));
+  small.height = Math.max(1, Math.round(full.height * scale));
+  var ctx = small.getContext("2d");
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(full, 0, 0, small.width, small.height);
+  full.width = full.height = 0;
+  res.diff = null; res.afterData = null;
+  return small;
 }
 
 /* Sorting by "most changed" can only happen once things are measured; moving
