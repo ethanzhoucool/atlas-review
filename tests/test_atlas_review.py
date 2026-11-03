@@ -373,9 +373,10 @@ class JsPythonParity(unittest.TestCase):
         self.js = (Path(__file__).resolve().parents[1]
                    / "src" / "atlas_review" / "assets" / "report.js").read_text()
 
-    def test_status_bar_mask_uses_floor_like_python(self):
-        self.assertIn("Math.floor(H * 0.07)", self.js)
-        self.assertNotIn("Math.round(H * 0.07)", self.js)
+    def test_ignore_boxes_use_floor_like_python(self):
+        # diff.box_bounds floors; rounding here would shift the mask by a row.
+        self.assertIn("Math.floor((b[1] + b[3]) * H)", self.js)
+        self.assertNotIn("Math.round(b[", self.js)
 
     def test_block_density_floor_uses_floor_like_python(self):
         # Python: max(1, int(density * block * block))

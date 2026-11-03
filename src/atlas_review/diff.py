@@ -10,6 +10,7 @@ scattered pixels into a handful of regions a human can actually look at.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -52,6 +53,21 @@ class DiffOptions:
                 boxes.append(IGNORE_PRESETS[name])
         boxes.extend(self.ignore_boxes)
         return boxes
+
+
+def box_bounds(box: Box, w: int, h: int) -> Tuple[int, int, int, int]:
+    """A normalized box as clamped pixel bounds (x0, y0, x1, y1).
+
+    floor() then clamp, exactly as `ignoreMask` in report.js does it, so the
+    page and the CLI mask the same pixels. Clamping both ends also keeps a box
+    that strays outside the frame from turning into a negative slice index.
+    """
+    bx, by, bw, bh = box
+
+    def clamp(value: float, limit: int) -> int:
+        return min(limit, max(0, int(math.floor(value))))
+
+    return (clamp(bx * w, w), clamp(by * h, h), clamp((bx + bw) * w, w), clamp((by + bh) * h, h))
 
 
 @dataclass
@@ -427,16 +443,27 @@ def _fit_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> str
 
 
 def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
-    """Boolean dilation by shifting -- avoids a scipy dependency."""
+    """Square boolean dilation that stops at the edges -- avoids a scipy dependency.
+
+    Separable (rows, then columns) and clipped rather than wrapped: np.roll
+    used to carry a change on the left edge over to the right edge, which
+    could glue unrelated regions together and made the CLI disagree with
+    `dilate()` in report.js.
+    """
     if radius <= 0:
         return mask
-    out = mask.copy()
-    for dy in range(-radius, radius + 1):
-        for dx in range(-radius, radius + 1):
-            if dx == 0 and dy == 0:
-                continue
-            out |= np.roll(np.roll(mask, dy, axis=0), dx, axis=1)
+    rows = mask.copy()
+    for d in range(1, radius + 1):
+        rows[d:] |= mask[:-d]
+        rows[:-d] |= mask[d:]
+    out = rows.copy()
+    for d in range(1, radius + 1):
+        out[:, d:] |= rows[:, :-d]
+        out[:, :-d] |= rows[:, d:]
     return out
+
+
+SHIFT_SAMPLE = 2  # pixel stride of the shift search, in both axes; report.js uses the same
 
 
 def _detect_shift(
@@ -452,25 +479,38 @@ def _detect_shift(
     diff reports as "the entire list changed". Recognising the translation lets
     the report say "12 rows moved down 22px" instead, which is the difference
     between a reviewer trusting the tool and ignoring it.
+
+    `before_gray`/`after_gray` hold r+g+b per pixel. The search samples every
+    other row and column, sums in integers, and divides once at the end -- the
+    same arithmetic as `annotateShift` in report.js, so both reach the same
+    verdict instead of disagreeing on borderline regions.
     """
     h, w = after_gray.shape
     y0, y1 = region.y, min(h, region.y + region.h)
     x0, x1 = region.x, min(w, region.x + region.w)
     if y1 - y0 < 16 or x1 - x0 < 16:
         return 0
-    patch = after_gray[y0:y1, x0:x1]
-    baseline = float(np.abs(patch - before_gray[y0:y1, x0:x1]).mean())
-    if baseline < 1.0:
+    step = SHIFT_SAMPLE
+    last = y0 + ((y1 - 1 - y0) // step) * step  # final sampled row
+    patch = after_gray[y0:y1:step, x0:x1:step].astype(np.int64)
+    samples = patch.size
+
+    def error(dy: int) -> Optional[float]:
+        sy0, sy_last = y0 - dy, last - dy
+        if sy0 < 0 or sy_last >= h:
+            return None
+        source = before_gray[sy0:sy_last + 1:step, x0:x1:step]
+        return int(np.abs(patch - source).sum()) / samples / 3
+
+    baseline = error(0)
+    if baseline is None or not baseline > 1.0:
         return 0
     best_dy, best_err = 0, baseline
     for dy in range(-max_shift, max_shift + 1, 2):
         if dy == 0:
             continue
-        sy0, sy1 = y0 - dy, y1 - dy
-        if sy0 < 0 or sy1 > h:
-            continue
-        err = float(np.abs(patch - before_gray[sy0:sy1, x0:x1]).mean())
-        if err < best_err:
+        err = error(dy)
+        if err is not None and err < best_err:
             best_dy, best_err = dy, err
     # A best match sitting on the edge of the search window usually means no
     # true alignment was found -- in a list of evenly spaced rows the search
@@ -570,10 +610,9 @@ def compare_images(
 
     ignore = np.zeros(delta.shape, dtype=bool)
     w, h = size
-    for bx, by, bw, bh in options.masks():
-        x0, y0 = int(bx * w), int(by * h)
-        x1, y1 = int((bx + bw) * w), int((by + bh) * h)
-        ignore[max(0, y0):min(h, y1), max(0, x0):min(w, x1)] = True
+    for box in options.masks():
+        x0, y0, x1, y1 = box_bounds(box, w, h)
+        ignore[y0:y1, x0:x1] = True
     delta[ignore] = 0
 
     raw = delta > options.tolerance
@@ -605,8 +644,8 @@ def compare_images(
             if region.area >= options.min_region_px:
                 regions.append(region)
     if options.detect_shift and regions:
-        before_gray = a.mean(axis=2).astype(np.float32)
-        after_gray = b.mean(axis=2).astype(np.float32)
+        before_gray = a.sum(axis=2, dtype=np.int32)
+        after_gray = b.sum(axis=2, dtype=np.int32)
         for region in regions:
             dy = _detect_shift(before_gray, after_gray, region)
             if dy:
