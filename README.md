@@ -306,5 +306,6 @@ it first. Screens are cached under `.atlas-review/cache` keyed by build id;
 python3 -m unittest discover -s tests
 ```
 
-45 tests, no network and no `revyl` CLI needed — images and payloads are
-synthetic.
+No network and no `revyl` CLI needed — images and payloads are synthetic.
+CI (`.github/workflows/tests.yml`) runs the suite on Python 3.9 and 3.13 against
+a regular `pip install .`, then checks the installed entry point and assets.
