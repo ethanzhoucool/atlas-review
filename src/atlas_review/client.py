@@ -67,7 +67,14 @@ class AtlasClient:
 
     def _run_json(self, args: List[str]) -> Dict[str, Any]:
         cmd = [self.revyl_bin] + args
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            raise RevylError("`%s` timed out after %ds" % (" ".join(cmd), self.timeout)) from None
+        except OSError as exc:
+            raise RevylError(
+                "could not run the revyl CLI at %s (%s); set REVYL_BIN or add revyl to PATH"
+                % (self.revyl_bin, exc.strerror or exc)) from None
         if proc.returncode != 0:
             raise RevylError(
                 "`%s` failed (exit %d): %s"

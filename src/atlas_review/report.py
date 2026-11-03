@@ -19,11 +19,12 @@ import hashlib
 import io
 import json
 import os
-import shutil
+import re
 import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
+from .diff import IGNORE_PRESETS, DiffOptions
 from .models import Screen
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -49,7 +50,11 @@ def _frame_width(image_path: Path) -> int:
         return probe.size[0]
 
 
-def _frame_payload(image_path: Path, target_width: int) -> Dict[str, Any]:
+def _frame_payload(
+    image_path: Path,
+    target_width: int,
+    seen: Optional[Dict[Any, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """A screenshot as a data URI plus its dimensions, rendered at `target_width`.
 
     A frame already at the target is embedded byte-for-byte: re-encoding would
@@ -58,25 +63,62 @@ def _frame_payload(image_path: Path, target_width: int) -> Dict[str, Any]:
     Anything else is resampled to the target, because a screen captured at 3x
     on one device and 1x on another has to be compared on one scale (see
     `diff.normalize_pair`). Resampled frames go out as PNG.
+
+    `seen` memoises by source bytes: a screen that did not change between
+    builds is the same file under a different build's cache directory, and
+    resampling + PNG-encoding it again only to deduplicate the identical
+    output afterwards was most of the cost of a report.
     """
     from PIL import Image
 
     from . import imaging
 
-    with Image.open(image_path) as probe:
+    raw = image_path.read_bytes()
+    key = (hashlib.sha1(raw).hexdigest(), target_width)
+    if seen is not None and key in seen:
+        return dict(seen[key])
+
+    with Image.open(io.BytesIO(raw)) as probe:
         width, height = probe.size
     if width == target_width:
         mime = _MIME.get(image_path.suffix.lower(), "image/png")
-        encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
-        return {"src": "data:%s;base64,%s" % (mime, encoded), "w": width, "h": height}
+        encoded = base64.b64encode(raw).decode("ascii")
+        frame = {"src": "data:%s;base64,%s" % (mime, encoded), "w": width, "h": height}
+    else:
+        img = imaging.load_rgb(io.BytesIO(raw))
+        scaled = img.resize(
+            (target_width, max(1, round(img.height * target_width / img.width))), Image.LANCZOS)
+        buffer = io.BytesIO()
+        scaled.save(buffer, "PNG", optimize=True)
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        frame = {"src": "data:image/png;base64," + encoded, "w": scaled.width, "h": scaled.height}
+    frame["digest"] = hashlib.sha1(frame["src"].encode("ascii")).hexdigest()[:16]
+    if seen is not None:
+        seen[key] = frame
+    return dict(frame)
 
-    img = imaging.load_rgb(image_path)
-    scaled = img.resize(
-        (target_width, max(1, round(img.height * target_width / img.width))), Image.LANCZOS)
-    buffer = io.BytesIO()
-    scaled.save(buffer, "PNG", optimize=True)
-    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-    return {"src": "data:image/png;base64," + encoded, "w": scaled.width, "h": scaled.height}
+
+def detector_defaults(options: DiffOptions) -> Dict[str, Any]:
+    """The detector settings report.js starts from, mirroring `options`.
+
+    Every ignore box the CLI applies is forwarded, not just the status bar:
+    a policy that also masks the home indicator or an ad banner must not read
+    as changed in the page while `check` calls it clean.
+    """
+    ignore = list(options.ignore)
+    extra = [IGNORE_PRESETS[name] for name in ignore if name in IGNORE_PRESETS and name != "status_bar"]
+    extra += [tuple(box) for box in options.ignore_boxes]
+    return {
+        "tolerance": options.tolerance,
+        "block": options.block,
+        "minBlockDensity": options.min_block_density,
+        "minRegionPx": options.min_region_px,
+        "mergeRadius": options.merge_radius,
+        "ignoreStatusBar": "status_bar" in ignore,
+        "statusBar": list(IGNORE_PRESETS["status_bar"]),
+        "ignoreBoxes": [[float(v) for v in box] for box in extra],
+        "detectShift": options.detect_shift,
+    }
 
 
 def build_report(
@@ -117,6 +159,7 @@ def build_report(
     # not change between builds otherwise ships the same bytes once per build,
     # which is most of the weight on a real app.
     images: Dict[str, str] = {}
+    sources: Dict[Any, Dict[str, Any]] = {}
 
     payload: Dict[str, Any] = {
         "app": review.app,
@@ -127,30 +170,25 @@ def build_report(
         "screens": [],
         "images": images,
         "alerts": [a.to_dict() for a in alert_report.sorted()],
-        "defaults": {
-            "tolerance": review.options.tolerance,
-            "block": review.options.block,
-            "minBlockDensity": review.options.min_block_density,
-            "minRegionPx": review.options.min_region_px,
-            "mergeRadius": review.options.merge_radius,
-            "ignoreStatusBar": "status_bar" in list(review.options.ignore),
-            "detectShift": review.options.detect_shift,
-        },
+        "defaults": detector_defaults(review.options),
     }
 
     total_frames = 0
     for screen in targets:
-        versions = [v for v in review.history(screen).versions() if v.build.id in kept]
+        every_version = review.history(screen).versions()
+        versions = [v for v in every_version if v.build.id in kept]
         if not versions:
             continue
         baseline = review.baseline(screen)
         # One width for every frame of a screen, matching what the detector
         # normalizes to, so the browser and the CLI measure the same pixels.
-        target_width = min([_frame_width(Path(v.image_path)) for v in versions] + [max_width])
+        # Taken over the whole history, as ScreenHistory.target_width() is,
+        # so `--builds N` cannot quietly pick a different scale than the CLI.
+        target_width = min([_frame_width(Path(v.image_path)) for v in every_version] + [max_width])
         frames: List[Dict[str, Any]] = []
         for version in versions:
-            frame = _frame_payload(Path(version.image_path), target_width)
-            digest = hashlib.sha1(frame["src"].encode("ascii")).hexdigest()[:16]
+            frame = _frame_payload(Path(version.image_path), target_width, sources)
+            digest = frame.pop("digest")
             if digest not in images:
                 images[digest] = frame["src"]
             frame.pop("src")
@@ -196,11 +234,7 @@ def build_report(
 
     css = (ASSETS / "report.css").read_text()
     js = (ASSETS / "report.js").read_text()
-    html = _SHELL
-    html = html.replace("/*__CSS__*/", css)
-    # Split the closing script tag so a literal one inside the data can't end it.
-    html = html.replace("__DATA__", json.dumps(payload).replace("</", "<\\/"))
-    html = html.replace("/*__JS__*/", js)
+    html = _fill_shell({"/*__CSS__*/": css, "__DATA__": script_json(payload), "/*__JS__*/": js})
     index.write_text(html)
 
     if not inline:
@@ -210,6 +244,33 @@ def build_report(
     if open_browser:
         webbrowser.open(index.resolve().as_uri())
     return index
+
+
+def script_json(payload: Any) -> str:
+    """JSON that is safe to place inside an inline <script> element.
+
+    Commit messages, author names and screen names are untrusted. Escaping
+    only `</` still lets `<!--<script>` push the HTML parser into its
+    "double escaped" state, after which the real `</script>` no longer
+    closes the element and the whole report goes blank. Writing every `<`,
+    `>` and `&` as a \\u escape means the parser never sees markup in the data,
+    and the result is still the same JSON value to JavaScript.
+    """
+    text = json.dumps(payload)
+    return text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+
+
+_SHELL_MARKERS = re.compile(r"/\*__CSS__\*/|__DATA__|/\*__JS__\*/")
+
+
+def _fill_shell(values: Dict[str, str]) -> str:
+    """Substitute the shell's placeholders in one pass over the template.
+
+    Sequential `str.replace` calls rescan text that was already inserted, so a
+    commit message containing `/*__JS__*/` used to get the whole script pasted
+    into the middle of the data and break the page.
+    """
+    return _SHELL_MARKERS.sub(lambda m: values[m.group(0)], _SHELL)
 
 
 def serve_dir(review: "AtlasReview", out: Path) -> Path:

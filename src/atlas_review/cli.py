@@ -17,26 +17,50 @@ from .diff import Box, DiffOptions
 DEFAULT_CONFIG = ".atlas-review.json"
 
 
+def _read_json(path: Path, what: str) -> dict:
+    """A JSON object from disk, or an error that names the file and the spot."""
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        raise SystemExit("cannot read %s %s: %s" % (what, path, exc.strerror or exc))
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise SystemExit("%s %s is not valid JSON (line %d, column %d): %s"
+                         % (what, path, exc.lineno, exc.colno, exc.msg))
+    if not isinstance(payload, dict):
+        raise SystemExit("%s %s must contain a JSON object" % (what, path))
+    return payload
+
+
 def _load_config(path: Optional[str]) -> dict:
     candidate = Path(path or DEFAULT_CONFIG)
     if not candidate.exists():
         if path:
             raise SystemExit("config not found: %s" % candidate)
         return {}
-    return json.loads(candidate.read_text())
+    return _read_json(candidate, "config")
 
 
 def _parse_region(text: Optional[str]) -> Optional[Box]:
-    """`x,y,w,h` as fractions (0.8,0.1,0.2,0.8) or pixels with a `px` suffix."""
+    """`x,y,w,h` as fractions of the frame, e.g. `0.78,0.15,0.22,0.8`."""
     if not text:
         return None
-    parts = [p.strip() for p in text.replace("px", "").split(",")]
+    example = "e.g. --region 0.04,0.175,0.9,0.045"
+    parts = [p.strip() for p in text.split(",")]
     if len(parts) != 4:
-        raise SystemExit("--region wants x,y,w,h")
-    values = [float(p) for p in parts]
-    if any(v > 1.0 for v in values):
-        raise SystemExit("--region takes fractions of the frame (0-1); got %s" % text)
-    return (values[0], values[1], values[2], values[3])
+        raise SystemExit("--region wants four comma-separated fractions x,y,w,h (%s); got %r"
+                         % (example, text))
+    try:
+        values = [float(p) for p in parts]
+    except ValueError:
+        raise SystemExit("--region values must be numbers between 0 and 1 (%s); got %r"
+                         % (example, text))
+    x, y, w, h = values
+    if not (0 <= x <= 1 and 0 <= y <= 1 and 0 < w <= 1 and 0 < h <= 1):
+        raise SystemExit("--region takes fractions of the frame (0-1) with a non-zero width "
+                         "and height (%s); got %r" % (example, text))
+    return (x, y, w, h)
 
 
 def _review(args: argparse.Namespace) -> AtlasReview:
@@ -265,7 +289,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
 
 def cmd_import(args: argparse.Namespace) -> int:
     review = _review(args)
-    payload = json.loads(Path(args.file).read_text())
+    payload = _read_json(Path(args.file), "review file")
     applied = review.store.merge(payload)
     review.store.save()
     print("merged %d record(s) into %s" % (applied, review.store.path))
@@ -421,6 +445,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     except KeyboardInterrupt:
         return 130
+    except BrokenPipeError:
+        # `atlas-review builds | head`: the reader went away, which is not a
+        # crash. Point stdout at devnull so the interpreter's final flush
+        # doesn't raise again, and exit the way a SIGPIPE'd tool would.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        return 141
 
 
 if __name__ == "__main__":  # pragma: no cover

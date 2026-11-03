@@ -18,7 +18,8 @@ try { local = JSON.parse(localStorage.getItem(LSKEY)) || local; } catch (e) {}
 
 var opts = Object.assign({
   tolerance: 32, block: 8, minBlockDensity: 0.06, minRegionPx: 220,
-  mergeRadius: 2, ignoreStatusBar: true, detectShift: true
+  mergeRadius: 2, ignoreStatusBar: true, detectShift: true,
+  statusBar: [0, 0, 1, 0.07], ignoreBoxes: []
 }, DATA.defaults || {});
 
 /* `before`/`after` are app-wide build ids, not per-screen. That is what makes
@@ -33,9 +34,13 @@ var overviewToken = 0;
 
 /* ------------------------------------------------------------- plumbing */
 
+/* Everything that reaches innerHTML from DATA goes through here. Commit
+   messages, author names, screen names, git remotes and review.json entries are
+   all untrusted, and some markup below uses single-quoted attributes, so the
+   apostrophe has to be escaped along with the usual four. */
 function esc(s) {
-  return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
-    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+  return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
   });
 }
 function el(id) { return document.getElementById(id); }
@@ -139,10 +144,30 @@ function dilate(mask, w, h, r) {
   return out;
 }
 
+/* r + g + b rather than their mean: integer sums keep the shift search exact,
+   so it reaches the same verdict as the Python detector bit for bit. */
 function grayscale(data, w, h) {
-  var g = new Float32Array(w * h), p = data.data;
-  for (var i = 0, j = 0; i < g.length; i++, j += 4) g[i] = (p[j] + p[j + 1] + p[j + 2]) / 3;
+  var g = new Int32Array(w * h), p = data.data;
+  for (var i = 0, j = 0; i < g.length; i++, j += 4) g[i] = p[j] + p[j + 1] + p[j + 2];
   return g;
+}
+
+/* Normalised [x, y, w, h] boxes -> pixel mask, with the same floor-and-clamp
+   arithmetic as diff.box_bounds(). The status bar is one of these boxes; the
+   policy's other presets and ignore_boxes arrive in o.ignoreBoxes. */
+function ignoreMask(W, H, o) {
+  var boxes = (o.ignoreBoxes || []).slice();
+  if (o.ignoreStatusBar && o.statusBar) boxes.push(o.statusBar);
+  if (!boxes.length) return null;
+  var m = new Uint8Array(W * H);
+  boxes.forEach(function (b) {
+    var x0 = Math.min(W, Math.max(0, Math.floor(b[0] * W)));
+    var y0 = Math.min(H, Math.max(0, Math.floor(b[1] * H)));
+    var x1 = Math.min(W, Math.max(0, Math.floor((b[0] + b[2]) * W)));
+    var y1 = Math.min(H, Math.max(0, Math.floor((b[1] + b[3]) * H)));
+    for (var y = y0; y < y1; y++) for (var x = x0; x < x1; x++) m[y * W + x] = 1;
+  });
+  return m;
 }
 
 /* Same shape as the Python detector: tolerance, then a block grid with a
@@ -150,13 +175,14 @@ function grayscale(data, w, h) {
 function computeDiff(A, B, W, H, o) {
   var a = A.data, b = B.data, n = W * H;
   var raw = new Uint8Array(n);
-  // floor, not round: the Python detector slices with int(), and the two must
+  // floor, not round: the Python detector slices with floor(), and the two must
   // agree to the digit or a CI gate and this page will contradict each other.
-  var ignoreRows = o.ignoreStatusBar ? Math.floor(H * 0.07) : 0;
-  var comparable = n - ignoreRows * W;
+  var ignore = ignoreMask(W, H, o);
+  var comparable = n;
+  if (ignore) for (var k = 0; k < n; k++) comparable -= ignore[k];
 
   for (var i = 0, j = 0; i < n; i++, j += 4) {
-    if (i < ignoreRows * W) continue;
+    if (ignore && ignore[i]) continue;
     var d = Math.abs(a[j] - b[j]);
     var d2 = Math.abs(a[j + 1] - b[j + 1]); if (d2 > d) d = d2;
     var d3 = Math.abs(a[j + 2] - b[j + 2]); if (d3 > d) d = d3;
@@ -235,7 +261,8 @@ function label(grid, cols, rows, bs, W, H, mask, o) {
 
 /* Inserting a row pushes everything below it down. Without recognising that
    translation the report says "the whole list changed", which is true and
-   useless. Subsampled by 2 in both axes to stay interactive. */
+   useless. Subsampled by 2 in both axes to stay interactive; diff._detect_shift
+   samples the same pixels. ga/gb hold r+g+b, hence the final / 3. */
 function annotateShift(region, ga, gb, W, H) {
   var y0 = region.y, y1 = Math.min(H, region.y + region.h);
   var x0 = region.x, x1 = Math.min(W, region.x + region.w);
@@ -250,7 +277,7 @@ function annotateShift(region, ga, gb, W, H) {
         total += Math.abs(gb[y * W + x] - ga[sy * W + x]); count++;
       }
     }
-    return count ? total / count : Infinity;
+    return count ? total / count / 3 : Infinity;
   }
 
   var base = err(0);
@@ -471,7 +498,7 @@ function paintCard(s, res) {
   var meta = el("cmeta-" + s.id), thumb = el("thumb-" + s.id), card = el("card-" + s.id);
   if (!meta || !thumb) return;
   var st = statusOf(s.id, ui.after);
-  var pill = st !== "pending" ? '<span class="pill ' + st + '">' + st + "</span>" : "";
+  var pill = st !== "pending" ? '<span class="pill ' + esc(st) + '">' + esc(st) + "</span>" : "";
 
   if (res.missing) {
     card.dataset.state = "missing";
@@ -750,7 +777,7 @@ function paintFilm() {
       '<img src="' + srcOf(f) + '" alt="' + esc(s.name) + " at " + esc(b.label) + '">' +
       '<div class="row"><span class="lbl">' + esc(b.label) + "</span>" +
         (role ? '<span class="role">' + role + "</span>" : "") +
-        (st !== "pending" ? '<span class="pill ' + st + '">' + st + "</span>" : "") +
+        (st !== "pending" ? '<span class="pill ' + esc(st) + '">' + esc(st) + "</span>" : "") +
         (n ? '<span class="pill">' + n + "</span>" : "") + "</div>" +
       '<div class="meta">' + esc(b.message || b.version) + "</div>" +
       '<div class="row">' + delta +
@@ -919,7 +946,7 @@ function paintRail() {
     return '<li><button type="button" data-screen="' + esc(s.id) + '"' +
       (ui.screen === s.id ? ' aria-current="true"' : "") + ">" +
       '<span class="nm">' + esc(s.name) + right + "</span>" +
-      '<span class="sub"><i class="dotm ' + sev + '"></i>' + s.frames.length + " builds" +
+      '<span class="sub"><i class="dotm ' + esc(sev) + '"></i>' + s.frames.length + " builds" +
       (s.product_area ? " · " + esc(s.product_area) : "") + "</span></button></li>";
   }).join("");
   Array.prototype.forEach.call(el("screens").querySelectorAll("button"), function (btn) {
@@ -1015,7 +1042,7 @@ function boot() {
   el("mode-note").textContent = DATA.served ? "writes to review.json" : "decisions stay in this browser";
 
   el("alerts").innerHTML = DATA.alerts.length ? DATA.alerts.map(function (a) {
-    return '<li><span class="sev ' + a.severity + '"></span><span class="msg"><b>' +
+    return '<li><span class="sev ' + esc(a.severity) + '"></span><span class="msg"><b>' +
       esc(a.screen.name) + "</b>" + esc(a.message) + "</span></li>";
   }).join("") : '<li style="color:var(--muted)">No policy alerts.</li>';
 
