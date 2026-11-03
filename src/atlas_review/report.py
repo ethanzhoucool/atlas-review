@@ -19,7 +19,7 @@ import hashlib
 import io
 import json
 import os
-import shutil
+import re
 import webbrowser
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
@@ -196,11 +196,7 @@ def build_report(
 
     css = (ASSETS / "report.css").read_text()
     js = (ASSETS / "report.js").read_text()
-    html = _SHELL
-    html = html.replace("/*__CSS__*/", css)
-    # Split the closing script tag so a literal one inside the data can't end it.
-    html = html.replace("__DATA__", json.dumps(payload).replace("</", "<\\/"))
-    html = html.replace("/*__JS__*/", js)
+    html = _fill_shell({"/*__CSS__*/": css, "__DATA__": script_json(payload), "/*__JS__*/": js})
     index.write_text(html)
 
     if not inline:
@@ -210,6 +206,33 @@ def build_report(
     if open_browser:
         webbrowser.open(index.resolve().as_uri())
     return index
+
+
+def script_json(payload: Any) -> str:
+    """JSON that is safe to place inside an inline <script> element.
+
+    Commit messages, author names and screen names are untrusted. Escaping
+    only `</` still lets `<!--<script>` push the HTML parser into its
+    "double escaped" state, after which the real `</script>` no longer
+    closes the element and the whole report goes blank. Writing every `<`,
+    `>` and `&` as a \\u escape means the parser never sees markup in the data,
+    and the result is still the same JSON value to JavaScript.
+    """
+    text = json.dumps(payload)
+    return text.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+
+
+_SHELL_MARKERS = re.compile(r"/\*__CSS__\*/|__DATA__|/\*__JS__\*/")
+
+
+def _fill_shell(values: Dict[str, str]) -> str:
+    """Substitute the shell's placeholders in one pass over the template.
+
+    Sequential `str.replace` calls rescan text that was already inserted, so a
+    commit message containing `/*__JS__*/` used to get the whole script pasted
+    into the middle of the data and break the page.
+    """
+    return _SHELL_MARKERS.sub(lambda m: values[m.group(0)], _SHELL)
 
 
 def serve_dir(review: "AtlasReview", out: Path) -> Path:
