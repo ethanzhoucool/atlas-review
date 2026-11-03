@@ -284,6 +284,14 @@ class AlertReport:
         return "\n".join(lines) + "\n"
 
 
+def builds_through(builds: Sequence[Build], head: Build) -> List[Build]:
+    """`builds` (oldest first) up to and including `head`."""
+    for index, build in enumerate(builds):
+        if build.id == head.id:
+            return list(builds[:index + 1])
+    return list(builds) + [head]
+
+
 def check(
     client: AtlasClient,
     policy: Policy,
@@ -298,7 +306,9 @@ def check(
     if not builds:
         return AlertReport(app=client.app, build=None)
     head = build or builds[-1]
-    build_order = [b.id for b in builds if (b.uploaded_at or b.id) <= (head.uploaded_at or head.id)]
+    # `builds` is already oldest-first; slice by position rather than comparing
+    # timestamps, which may be missing or mix naive and aware datetimes.
+    build_order = [b.id for b in builds_through(builds, head)]
     by_id = {b.id: b for b in builds}
     report = AlertReport(app=client.app, build=head)
 
@@ -327,7 +337,7 @@ def check(
             approved_id = store.baseline_build_id(screen.id, build_order[:-1])
             chosen = by_id.get(approved_id) if approved_id else None
         if chosen is None:
-            earlier = [b for b in builds if b.id in build_order and b.id != head.id]
+            earlier = [by_id[b] for b in build_order[:-1]]
             for candidate in reversed(earlier):
                 version = history.version(candidate)
                 if version is not None and version.has_image:

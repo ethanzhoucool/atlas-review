@@ -29,6 +29,16 @@ def _parse_ts(value: Optional[str]) -> Optional[_dt.datetime]:
     return None
 
 
+def _parse_pr(value: Any) -> Optional[int]:
+    """A PR number from build metadata: `42`, `"42"` and `"#42"` all mean 42."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    text = str(value).strip().lstrip("#")
+    return int(text) if text.isascii() and text.isdigit() and int(text) > 0 else None
+
+
 def _humanize(ts: Optional[_dt.datetime]) -> str:
     if ts is None:
         return "unknown time"
@@ -90,7 +100,7 @@ class Build:
             committed_at=_parse_ts(git.get("timestamp")),
             dirty=bool(git.get("dirty")),
             remote=git.get("remote"),
-            pr_number=git.get("pr") or git.get("pr_number"),
+            pr_number=_parse_pr(git.get("pr") or git.get("pr_number")),
             raw=payload,
         )
 
