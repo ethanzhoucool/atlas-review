@@ -34,9 +34,13 @@ var overviewToken = 0;
 
 /* ------------------------------------------------------------- plumbing */
 
+/* Everything that reaches innerHTML from DATA goes through here. Commit
+   messages, author names, screen names, git remotes and review.json entries are
+   all untrusted, and some markup below uses single-quoted attributes, so the
+   apostrophe has to be escaped along with the usual four. */
 function esc(s) {
-  return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
-    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+  return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
   });
 }
 function el(id) { return document.getElementById(id); }
@@ -473,7 +477,7 @@ function paintCard(s, res) {
   var meta = el("cmeta-" + s.id), thumb = el("thumb-" + s.id), card = el("card-" + s.id);
   if (!meta || !thumb) return;
   var st = statusOf(s.id, ui.after);
-  var pill = st !== "pending" ? '<span class="pill ' + st + '">' + st + "</span>" : "";
+  var pill = st !== "pending" ? '<span class="pill ' + esc(st) + '">' + esc(st) + "</span>" : "";
 
   if (res.missing) {
     card.dataset.state = "missing";
@@ -733,7 +737,7 @@ function paintFilm() {
       '<img src="' + srcOf(f) + '" alt="' + esc(s.name) + " at " + esc(b.label) + '">' +
       '<div class="row"><span class="lbl">' + esc(b.label) + "</span>" +
         (role ? '<span class="role">' + role + "</span>" : "") +
-        (st !== "pending" ? '<span class="pill ' + st + '">' + st + "</span>" : "") +
+        (st !== "pending" ? '<span class="pill ' + esc(st) + '">' + esc(st) + "</span>" : "") +
         (n ? '<span class="pill">' + n + "</span>" : "") + "</div>" +
       '<div class="meta">' + esc(b.message || b.version) + "</div>" +
       '<div class="row">' + delta +
@@ -902,7 +906,7 @@ function paintRail() {
     return '<li><button type="button" data-screen="' + esc(s.id) + '"' +
       (ui.screen === s.id ? ' aria-current="true"' : "") + ">" +
       '<span class="nm">' + esc(s.name) + right + "</span>" +
-      '<span class="sub"><i class="dotm ' + sev + '"></i>' + s.frames.length + " builds" +
+      '<span class="sub"><i class="dotm ' + esc(sev) + '"></i>' + s.frames.length + " builds" +
       (s.product_area ? " · " + esc(s.product_area) : "") + "</span></button></li>";
   }).join("");
   Array.prototype.forEach.call(el("screens").querySelectorAll("button"), function (btn) {
@@ -998,7 +1002,7 @@ function boot() {
   el("mode-note").textContent = DATA.served ? "writes to review.json" : "decisions stay in this browser";
 
   el("alerts").innerHTML = DATA.alerts.length ? DATA.alerts.map(function (a) {
-    return '<li><span class="sev ' + a.severity + '"></span><span class="msg"><b>' +
+    return '<li><span class="sev ' + esc(a.severity) + '"></span><span class="msg"><b>' +
       esc(a.screen.name) + "</b>" + esc(a.message) + "</span></li>";
   }).join("") : '<li style="color:var(--muted)">No policy alerts.</li>';
 

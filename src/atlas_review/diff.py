@@ -208,24 +208,38 @@ class DiffResult:
         box overcounts badly -- one tall region clipping the corner would
         contribute all of its pixels. This clips against the mask instead.
         """
-        if self._mask is None:
+        bounds = self._box_bounds(box)
+        if bounds is None:
             return 0
+        x0, y0, x1, y1 = bounds
+        return int(self._mask[y0:y1, x0:x1].sum())
+
+    def changed_fraction_in(self, box: Box) -> float:
+        """Changed pixels inside a box, as a fraction of that box's area on the frame.
+
+        The area is that of the same clipped pixel rectangle `changed_in`
+        counts. Dividing by the box's nominal size instead meant a watch box
+        that overhangs the frame edge -- `[0.8, 0.9, 0.4, 0.2]` -- could never
+        read more than a quarter changed, however much of it really did.
+        """
+        bounds = self._box_bounds(box)
+        if bounds is None:
+            return 0.0
+        x0, y0, x1, y1 = bounds
+        return self.changed_in(box) / float((x1 - x0) * (y1 - y0))
+
+    def _box_bounds(self, box: Box) -> Optional[Tuple[int, int, int, int]]:
+        """A normalized box as pixel bounds clipped to the frame; None if empty."""
+        if self._mask is None:
+            return None
         h, w = self._mask.shape
         x0 = max(0, min(w, int(box[0] * w)))
         y0 = max(0, min(h, int(box[1] * h)))
         x1 = max(0, min(w, int((box[0] + box[2]) * w)))
         y1 = max(0, min(h, int((box[1] + box[3]) * h)))
         if x1 <= x0 or y1 <= y0:
-            return 0
-        return int(self._mask[y0:y1, x0:x1].sum())
-
-    def changed_fraction_in(self, box: Box) -> float:
-        """Changed pixels inside a box, as a fraction of that box's area."""
-        if self._mask is None:
-            return 0.0
-        h, w = self._mask.shape
-        area = max(1, int(box[2] * w) * int(box[3] * h))
-        return self.changed_in(box) / area
+            return None
+        return (x0, y0, x1, y1)
 
     def regions_in(self, box: Box) -> List[Region]:
         return [r for r in self.regions if r.overlaps(box)]
@@ -621,9 +635,7 @@ def compare_images(
             rs, cs = np.nonzero(member)
             y0, y1 = int(rs.min() * block), int(min(h, (rs.max() + 1) * block))
             x0, x1 = int(cs.min() * block), int(min(w, (cs.max() + 1) * block))
-            region_mask = np.zeros((h, w), dtype=bool)
-            region_mask[y0:y1, x0:x1] = True
-            changed_here = int((mask & region_mask).sum())
+            changed_here = int(mask[y0:y1, x0:x1].sum())
             region = Region(
                 x=x0, y=y0, w=x1 - x0, h=y1 - y0,
                 changed_pixels=changed_here,
@@ -662,10 +674,11 @@ def diff_versions(
         raise ValueError("no cached screenshot for %s at build %s" % (after.screen.name, missing))
     before_img = imaging.load_rgb(Path(before.image_path))
     after_img = imaging.load_rgb(Path(after.image_path))
-    mask, regions, changed_px, comparable, resized = compare_images(
-        before_img, after_img, options, target_width)
-    # Renderers must draw the same normalized frames the detector measured.
-    before_img, after_img, _ = normalize_pair(before_img, after_img, target_width)
+    # Normalise once, up front: the renderers must draw the same frames the
+    # detector measured, and resampling is the most expensive step of a diff.
+    # compare_images() finds the pair already at one width and leaves it be.
+    before_img, after_img, resized = normalize_pair(before_img, after_img, target_width)
+    mask, regions, changed_px, comparable, _ = compare_images(before_img, after_img, options)
     size = (max(before_img.width, after_img.width), max(before_img.height, after_img.height))
     result = DiffResult(
         before=before,
