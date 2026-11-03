@@ -49,7 +49,11 @@ def _frame_width(image_path: Path) -> int:
         return probe.size[0]
 
 
-def _frame_payload(image_path: Path, target_width: int) -> Dict[str, Any]:
+def _frame_payload(
+    image_path: Path,
+    target_width: int,
+    seen: Optional[Dict[Any, Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     """A screenshot as a data URI plus its dimensions, rendered at `target_width`.
 
     A frame already at the target is embedded byte-for-byte: re-encoding would
@@ -58,25 +62,39 @@ def _frame_payload(image_path: Path, target_width: int) -> Dict[str, Any]:
     Anything else is resampled to the target, because a screen captured at 3x
     on one device and 1x on another has to be compared on one scale (see
     `diff.normalize_pair`). Resampled frames go out as PNG.
+
+    `seen` memoises by source bytes: a screen that did not change between
+    builds is the same file under a different build's cache directory, and
+    resampling + PNG-encoding it again only to deduplicate the identical
+    output afterwards was most of the cost of a report.
     """
     from PIL import Image
 
     from . import imaging
 
-    with Image.open(image_path) as probe:
+    raw = image_path.read_bytes()
+    key = (hashlib.sha1(raw).hexdigest(), target_width)
+    if seen is not None and key in seen:
+        return dict(seen[key])
+
+    with Image.open(io.BytesIO(raw)) as probe:
         width, height = probe.size
     if width == target_width:
         mime = _MIME.get(image_path.suffix.lower(), "image/png")
-        encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
-        return {"src": "data:%s;base64,%s" % (mime, encoded), "w": width, "h": height}
-
-    img = imaging.load_rgb(image_path)
-    scaled = img.resize(
-        (target_width, max(1, round(img.height * target_width / img.width))), Image.LANCZOS)
-    buffer = io.BytesIO()
-    scaled.save(buffer, "PNG", optimize=True)
-    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-    return {"src": "data:image/png;base64," + encoded, "w": scaled.width, "h": scaled.height}
+        encoded = base64.b64encode(raw).decode("ascii")
+        frame = {"src": "data:%s;base64,%s" % (mime, encoded), "w": width, "h": height}
+    else:
+        img = imaging.load_rgb(io.BytesIO(raw))
+        scaled = img.resize(
+            (target_width, max(1, round(img.height * target_width / img.width))), Image.LANCZOS)
+        buffer = io.BytesIO()
+        scaled.save(buffer, "PNG", optimize=True)
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        frame = {"src": "data:image/png;base64," + encoded, "w": scaled.width, "h": scaled.height}
+    frame["digest"] = hashlib.sha1(frame["src"].encode("ascii")).hexdigest()[:16]
+    if seen is not None:
+        seen[key] = frame
+    return dict(frame)
 
 
 def build_report(
@@ -117,6 +135,7 @@ def build_report(
     # not change between builds otherwise ships the same bytes once per build,
     # which is most of the weight on a real app.
     images: Dict[str, str] = {}
+    sources: Dict[Any, Dict[str, Any]] = {}
 
     payload: Dict[str, Any] = {
         "app": review.app,
@@ -149,8 +168,8 @@ def build_report(
         target_width = min([_frame_width(Path(v.image_path)) for v in versions] + [max_width])
         frames: List[Dict[str, Any]] = []
         for version in versions:
-            frame = _frame_payload(Path(version.image_path), target_width)
-            digest = hashlib.sha1(frame["src"].encode("ascii")).hexdigest()[:16]
+            frame = _frame_payload(Path(version.image_path), target_width, sources)
+            digest = frame.pop("digest")
             if digest not in images:
                 images[digest] = frame["src"]
             frame.pop("src")

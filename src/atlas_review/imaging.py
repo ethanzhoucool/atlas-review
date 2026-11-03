@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import BinaryIO, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -51,9 +51,12 @@ def load_font(size: int = 14, bold: bool = False, mono: bool = False) -> ImageFo
     return ImageFont.load_default()
 
 
-def load_rgb(path: Path) -> Image.Image:
-    """Open an image as RGB, flattening any alpha onto white."""
+def load_rgb(path: Union[Path, BinaryIO]) -> Image.Image:
+    """Open an image (a path or a binary file object) as RGB, flattening any alpha onto white."""
     img = Image.open(path)
+    if img.mode == "RGB":
+        img.load()  # already RGB: convert() would only make a full copy
+        return img
     if img.mode in ("RGBA", "LA", "P"):
         img = img.convert("RGBA")
         canvas = Image.new("RGBA", img.size, (255, 255, 255, 255))
