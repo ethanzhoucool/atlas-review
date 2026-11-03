@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .client import AtlasClient
-from .diff import Box, DiffOptions, DiffResult, diff_versions
+from .diff import IGNORE_PRESETS, Box, DiffOptions, DiffResult, diff_versions
 from .models import Build, Screen
 from .review import APPROVED, ReviewStore
 from .timeline import ScreenHistory
@@ -28,6 +28,48 @@ ERROR = "error"
 WARNING = "warning"
 INFO = "info"
 _RANK = {ERROR: 0, WARNING: 1, INFO: 2}
+COMPARE_AGAINST = ("approved", "previous")
+
+
+# -- policy validation ------------------------------------------------------
+#
+# A typo in .atlas-review.json used to surface much later, as a KeyError or
+# IndexError traceback from inside `check` -- and only on the build where an
+# alert finally fired. Validate on load and name the offending key instead.
+
+
+def _mapping(value: Any, where: str) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("%s must be a JSON object, got %s" % (where, type(value).__name__))
+    return value
+
+
+def _severity(value: Any, where: str) -> str:
+    if value not in _RANK:
+        raise ValueError("%s: severity must be one of %s, got %r" % (where, ", ".join(_RANK), value))
+    return value
+
+
+def _number(value: Any, where: str, kind: type = float) -> Any:
+    if isinstance(value, bool):
+        raise ValueError("%s must be a number, got %r" % (where, value))
+    try:
+        return kind(value)
+    except (TypeError, ValueError):
+        raise ValueError("%s must be a number, got %r" % (where, value)) from None
+
+
+def _box(value: Any, where: str) -> Box:
+    message = "%s must be [x, y, w, h] as fractions of the frame (0-1), got %r" % (where, value)
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise ValueError(message)
+    try:
+        x, y, w, h = (_number(v, where) for v in value)
+    except ValueError:
+        raise ValueError(message) from None
+    if not (0 <= x <= 1 and 0 <= y <= 1 and 0 < w <= 1 and 0 < h <= 1):
+        raise ValueError(message)
+    return (x, y, w, h)
 
 
 @dataclass
@@ -51,23 +93,35 @@ class ScreenPolicy:
     alert_on_removed: bool = True
 
     @classmethod
-    def from_dict(cls, raw: Dict[str, Any], base: Optional["ScreenPolicy"] = None) -> "ScreenPolicy":
+    def from_dict(
+        cls,
+        raw: Dict[str, Any],
+        base: Optional["ScreenPolicy"] = None,
+        where: str = "policy.default",
+    ) -> "ScreenPolicy":
         base = base or cls()
-        watch = [
-            WatchRegion(
-                name=w.get("name", "watched region"),
-                box=tuple(w["box"]),  # type: ignore[arg-type]
-                max_change_pct=float(w.get("max_change_pct", 0.0)),
-                severity=w.get("severity", ERROR),
+        raw = _mapping(raw, where)
+        entries = raw.get("watch", [])
+        if not isinstance(entries, list):
+            raise ValueError("%s.watch must be a list of regions" % where)
+        watch = []
+        for index, w in enumerate(entries):
+            spot = "%s.watch[%d]" % (where, index)
+            w = _mapping(w, spot)
+            if "box" not in w:
+                raise ValueError("%s needs a \"box\": [x, y, w, h]" % spot)
+            watch.append(WatchRegion(
+                name=str(w.get("name", "watched region")),
+                box=_box(w["box"], spot + ".box"),
+                max_change_pct=_number(w.get("max_change_pct", 0.0), spot + ".max_change_pct"),
+                severity=_severity(w.get("severity", ERROR), spot),
                 ignore_approval=bool(w.get("ignore_approval", False)),
-            )
-            for w in raw.get("watch", [])
-            if w.get("box")
-        ]
+            ))
         return cls(
-            max_change_pct=float(raw.get("max_change_pct", base.max_change_pct)),
+            max_change_pct=_number(raw.get("max_change_pct", base.max_change_pct),
+                                   where + ".max_change_pct"),
             require_approval=bool(raw.get("require_approval", base.require_approval)),
-            severity=raw.get("severity", base.severity),
+            severity=_severity(raw.get("severity", base.severity), where),
             watch=watch or list(base.watch),
             alert_on_new=bool(raw.get("alert_on_new", base.alert_on_new)),
             alert_on_removed=bool(raw.get("alert_on_removed", base.alert_on_removed)),
@@ -90,26 +144,43 @@ class Policy:
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "Policy":
+        raw = _mapping(raw, "policy")
         default = ScreenPolicy.from_dict(raw.get("default", {}))
         screens = {
-            name: ScreenPolicy.from_dict(cfg, default)
-            for name, cfg in (raw.get("screens") or {}).items()
+            name: ScreenPolicy.from_dict(cfg, default, where="policy.screens.%s" % name)
+            for name, cfg in _mapping(raw.get("screens") or {}, "policy.screens").items()
         }
         options = DiffOptions()
-        diff_raw = raw.get("diff") or {}
+        diff_raw = dict(_mapping(raw.get("diff") or {}, "policy.diff"))
         if "ignore" in raw:
             diff_raw.setdefault("ignore", raw["ignore"])
         for key in ("tolerance", "block", "min_block_density", "min_region_px", "merge_radius"):
             if key in diff_raw:
-                setattr(options, key, type(getattr(options, key))(diff_raw[key]))
+                kind = type(getattr(options, key))
+                setattr(options, key, _number(diff_raw[key], "policy.diff." + key, kind))
         if "ignore" in diff_raw:
-            options.ignore = list(diff_raw["ignore"])
+            names = diff_raw["ignore"]
+            if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+                raise ValueError("policy.diff.ignore must be a list of preset names")
+            unknown = [n for n in names if n not in IGNORE_PRESETS]
+            if unknown:
+                raise ValueError("policy.diff.ignore: unknown preset %s (have: %s)" % (
+                    ", ".join(repr(n) for n in unknown), ", ".join(sorted(IGNORE_PRESETS))))
+            options.ignore = list(names)
         if "ignore_boxes" in diff_raw:
-            options.ignore_boxes = [tuple(b) for b in diff_raw["ignore_boxes"]]
+            boxes = diff_raw["ignore_boxes"]
+            if not isinstance(boxes, list):
+                raise ValueError("policy.diff.ignore_boxes must be a list of [x, y, w, h] boxes")
+            options.ignore_boxes = [
+                _box(b, "policy.diff.ignore_boxes[%d]" % i) for i, b in enumerate(boxes)]
+        compare_against = raw.get("compare_against", "approved")
+        if compare_against not in COMPARE_AGAINST:
+            raise ValueError("policy.compare_against must be one of %s, got %r"
+                             % (", ".join(COMPARE_AGAINST), compare_against))
         return cls(
             default=default,
             screens=screens,
-            compare_against=raw.get("compare_against", "approved"),
+            compare_against=compare_against,
             diff_options=options,
         )
 
@@ -213,6 +284,14 @@ class AlertReport:
         return "\n".join(lines) + "\n"
 
 
+def builds_through(builds: Sequence[Build], head: Build) -> List[Build]:
+    """`builds` (oldest first) up to and including `head`."""
+    for index, build in enumerate(builds):
+        if build.id == head.id:
+            return list(builds[:index + 1])
+    return list(builds) + [head]
+
+
 def check(
     client: AtlasClient,
     policy: Policy,
@@ -227,7 +306,9 @@ def check(
     if not builds:
         return AlertReport(app=client.app, build=None)
     head = build or builds[-1]
-    build_order = [b.id for b in builds if (b.uploaded_at or b.id) <= (head.uploaded_at or head.id)]
+    # `builds` is already oldest-first; slice by position rather than comparing
+    # timestamps, which may be missing or mix naive and aware datetimes.
+    build_order = [b.id for b in builds_through(builds, head)]
     by_id = {b.id: b for b in builds}
     report = AlertReport(app=client.app, build=head)
 
@@ -256,7 +337,7 @@ def check(
             approved_id = store.baseline_build_id(screen.id, build_order[:-1])
             chosen = by_id.get(approved_id) if approved_id else None
         if chosen is None:
-            earlier = [b for b in builds if b.id in build_order and b.id != head.id]
+            earlier = [by_id[b] for b in build_order[:-1]]
             for candidate in reversed(earlier):
                 version = history.version(candidate)
                 if version is not None and version.has_image:

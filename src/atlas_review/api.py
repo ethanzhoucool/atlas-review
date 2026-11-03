@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Union
 
-from .alerts import AlertReport, Policy, check
+from .alerts import AlertReport, Policy, builds_through, check
 from .client import AtlasClient, resolve_pr_numbers
 from .diff import Box, DiffOptions, DiffResult, diff_versions
 from .models import Build, Screen, ScreenVersion
@@ -216,7 +216,7 @@ class AtlasReview:
     def _previous_version(self, hist: ScreenHistory, head: Build):
         """The approved baseline for a screen, else the build before `head`."""
         builds = self.builds()
-        order = [b for b in builds if (b.uploaded_at or "") <= (head.uploaded_at or "") and b.id != head.id]
+        order = builds_through(builds, head)[:-1]
         if self.policy.compare_against == "approved":
             approved = self.store.baseline_build_id(hist.screen.id, [b.id for b in order])
             if approved:
