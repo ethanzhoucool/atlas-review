@@ -362,10 +362,6 @@ class AlertReporting(unittest.TestCase):
         self.assertEqual(self._report().sorted()[0].severity, ERROR)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class JsPythonParity(unittest.TestCase):
     """The report re-implements the detector in JS; the constants must match.
 
@@ -504,3 +500,7 @@ class ReportCliAgreement(unittest.TestCase):
         small, big = frame(), frame().resize((W * 3, H * 3))
         a, b, _ = normalize_pair(small, big, 120)
         self.assertEqual((a.width, b.width), (120, 120))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
